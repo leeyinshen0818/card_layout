@@ -76,6 +76,15 @@ scene. Multi-signal contour boundaries are preferred over isolated Hough-line
 rectangles when their footprints agree. Small printed rectangles and partial
 reconstructions are prevented from outranking a credible full-card boundary.
 
+A conservative **Complete Card Fast Path** can propose a directly observed quad
+with strong outer-edge, geometry, aspect-ratio, and independent contour/line
+evidence. The proposal is non-destructive: it does not change candidate scores,
+override selection, or skip reconstruction. It is confirmed only when the
+completed normal pipeline independently returns essentially the same area,
+center, and geometry. Card-like rasters whose physical perimeter lies very near
+all four image edges are handled as full-card inputs before internal rectangles
+can compete.
+
 For a card held by a hand, the detector can preserve or extrapolate the likely
 outer geometry when a finger obscures an edge or corner. A lower-confidence but
 credible full-card candidate is retained for review and manual adjustment instead
@@ -236,11 +245,13 @@ manual corners, orientation transforms, Front-only output, appearance correction
 reset behavior, responsive UI, and sidebar interactions. GUI tests run without
 manually opening the application.
 
-The current suite contains **178 passing tests**. Detection regressions include
+The current suite contains **190 passing tests**. Detection regressions include
 generic card colors, strong perspective, close-up and distant cards, cards held by
 a hand, cluttered desks, monitor/keyboard distractors, strong internal rectangles,
-and low-contrast card backs. The packaged one-file Windows build is also rebuilt
-after detector changes so `dist\CardLayout.exe` contains the current pipeline.
+low-contrast card backs, dense text, chips, portrait regions, rounded corners, and
+complete cards on light or dark backgrounds. The packaged one-file Windows build
+is also rebuilt after detector changes so `dist\CardLayout.exe` contains the
+current pipeline.
 
 ## Privacy
 

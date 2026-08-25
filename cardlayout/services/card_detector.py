@@ -71,6 +71,7 @@ class _Candidate:
     full_card_boundary_score: float = 0.0
     candidate_coverage_score: float = 0.0
     internal_subregion_penalty: float = 0.0
+    partial_card_candidate_penalty: float = 0.0
     candidate_id: str = ""
     contains_candidates: tuple[str, ...] = ()
     contained_by_candidates: tuple[str, ...] = ()
@@ -113,7 +114,14 @@ class _Candidate:
             "nested_candidate_score": round(self.nested_candidate_score, 4),
             "full_card_boundary_score": round(self.full_card_boundary_score, 4),
             "candidate_coverage_score": round(self.candidate_coverage_score, 4),
+            # Explicit alias used by the complete-card acceptance diagnostics.
+            "full_card_coverage_score": round(
+                self.candidate_coverage_score, 4
+            ),
             "internal_subregion_penalty": round(self.internal_subregion_penalty, 4),
+            "partial_card_candidate_penalty": round(
+                self.partial_card_candidate_penalty, 4
+            ),
             "background_penalty": round(self.background_penalty, 4),
             "oversize_penalty": round(self.oversize_penalty, 4),
             "uniform_surface_penalty": round(self.uniform_surface_penalty, 4),
@@ -189,6 +197,11 @@ class CardDetector:
 
         all_candidates: list[_Candidate] = []
         pass_results: list[_PassResult] = []
+        complete_card_decision: dict[str, Any] = {
+            "used": False,
+            "reason": "No complete-card pass has run",
+        }
+        complete_card_proposal: _Candidate | None = None
 
         fast = self._run_pass(
             original,
@@ -237,6 +250,13 @@ class CardDetector:
             all_candidates.extend(detailed.candidates)
             fused = self._contextual_rank(self._fuse_candidates(all_candidates), original)
 
+        # The fast path is proposal-only. It never mutates ranking and never
+        # skips recovery; the completed normal pipeline must independently
+        # confirm the same full-card extent before it is considered accepted.
+        complete_card_proposal, complete_card_decision = (
+            self._complete_card_fast_path_proposal(fused)
+        )
+
         if self._needs_reconstruction(fused):
             reconstruction = self._run_pass(
                 original,
@@ -250,7 +270,14 @@ class CardDetector:
             all_candidates.extend(reconstruction.candidates)
             fused = self._contextual_rank(self._fuse_candidates(all_candidates), original)
 
+        complete_card_decision = self._validate_complete_card_proposal(
+            complete_card_proposal,
+            fused,
+            complete_card_decision,
+        )
+
         self._attach_pass_debug(debug_info, pass_results, fused, original)
+        debug_info["complete_card_fast_path"] = complete_card_decision
         if not fused:
             return self._finalize(
                 self._failure("No plausible card region was found"),
@@ -1206,6 +1233,7 @@ class CardDetector:
                 + 0.06 * (candidate.full_card_boundary_score - 0.5)
                 + 0.04 * (candidate.candidate_coverage_score - 0.5)
                 - candidate.internal_subregion_penalty
+                - candidate.partial_card_candidate_penalty
                 + candidate.partial_evidence_bonus
                 - candidate.border_touches * self.config.border_touch_penalty,
                 0.0,
@@ -1323,6 +1351,25 @@ class CardDetector:
             + source_bonus
         )
 
+    @staticmethod
+    def _has_strong_complete_extent(candidate: _Candidate) -> bool:
+        """Return whether a large quad has independent full-perimeter evidence."""
+        groups = candidate.strategy_groups
+        return (
+            candidate.inferred_edges == 0
+            and 0.18 <= candidate.area_ratio <= 0.45
+            and candidate.ratio_score >= 0.78
+            and candidate.geometry_score >= 0.85
+            and candidate.edge_score >= 0.80
+            and candidate.agreement_score >= 0.45
+            and candidate.full_card_boundary_score >= 0.75
+            and candidate.candidate_coverage_score >= 0.80
+            and candidate.border_touches == 0
+            and "line4" in groups
+            and "contour" in groups
+            and "rotated_rect" in groups
+        )
+
     def _contextual_rank(
         self, candidates: list[_Candidate], original_rgb: np.ndarray
     ) -> list[_Candidate]:
@@ -1360,7 +1407,12 @@ class CardDetector:
             )
             candidate.nested_candidate_score = 0.0
             candidate.internal_subregion_penalty = 0.0
+            candidate.partial_card_candidate_penalty = 0.0
             candidate.oversize_penalty = self._oversize_penalty(candidate.area_ratio)
+            if self._has_strong_complete_extent(candidate):
+                candidate.oversize_penalty = min(
+                    candidate.oversize_penalty, 0.025
+                )
             candidate.uniform_surface_penalty = self._uniform_surface_penalty(
                 candidate.area_ratio, complexity
             )
@@ -1558,11 +1610,17 @@ class CardDetector:
                         (
                             parent.area_ratio
                             <= self.config.oversize_start_ratio
-                            and not nested_card_competitor
+                            and (
+                                not nested_card_competitor
+                                or self._has_strong_complete_extent(parent)
+                            )
                         )
                         or (
                             parent.area_ratio <= self.config.oversize_full_ratio
-                            and not nested_card_competitor
+                            and (
+                                not nested_card_competitor
+                                or self._has_strong_complete_extent(parent)
+                            )
                         )
                     )
                     and parent.geometry_score >= 0.72
@@ -1623,6 +1681,25 @@ class CardDetector:
                                 )
                             ),
                         )
+                        if (
+                            child_fraction <= 0.72
+                            and self._has_strong_complete_extent(parent)
+                        ):
+                            missing_extent = float(
+                                np.clip(
+                                    (0.72 - child_fraction) / 0.64,
+                                    0.0,
+                                    1.0,
+                                )
+                            )
+                            child.partial_card_candidate_penalty = max(
+                                child.partial_card_candidate_penalty,
+                                self.config.partial_card_candidate_penalty
+                                * (0.55 + 0.45 * missing_extent),
+                            )
+                            rejection_sets[child_index].add(
+                                "partial_card_candidate"
+                            )
                         child.candidate_coverage_score = min(
                             child.candidate_coverage_score,
                             float(np.clip(child_fraction / 0.86, 0.0, 1.0)),
@@ -1900,6 +1977,127 @@ class CardDetector:
             )
             candidate.rejection_reasons = tuple(sorted(rejection_sets[index]))
         return ranked
+
+    def _complete_card_fast_path_proposal(
+        self, candidates: list[_Candidate]
+    ) -> tuple[_Candidate | None, dict[str, Any]]:
+        """Return a non-mutating complete-card proposal for later validation."""
+        disqualifying_reasons = {
+            "internal_subregion",
+            "mixed_background_boundary",
+            "multi_signal_boundary_preferred",
+            "nested_parent_penalty",
+            "oversized_background",
+        }
+        eligible: list[_Candidate] = []
+        for candidate in candidates:
+            groups = candidate.strategy_groups
+            independent_contour_and_line = (
+                "line4" in groups
+                and bool({"contour", "rotated_rect"} & groups)
+                and candidate.agreement_score >= 0.35
+            )
+            if (
+                candidate.inferred_edges == 0
+                and independent_contour_and_line
+                and self.config.complete_card_min_area_ratio
+                <= candidate.area_ratio
+                <= self.config.complete_card_max_area_ratio
+                and candidate.full_card_boundary_score
+                >= self.config.complete_card_min_boundary_score
+                and candidate.candidate_coverage_score
+                >= self.config.complete_card_min_coverage_score
+                and candidate.ratio_score
+                >= self.config.complete_card_min_ratio_score
+                and candidate.geometry_score
+                >= self.config.complete_card_min_geometry_score
+                and candidate.edge_score
+                >= self.config.complete_card_min_edge_score
+                and candidate.parallelism_score >= 0.78
+                and candidate.perspective_score >= 0.74
+                and candidate.border_touches == 0
+                and candidate.internal_subregion_penalty == 0
+                and not disqualifying_reasons.intersection(
+                    candidate.rejection_reasons
+                )
+            ):
+                eligible.append(candidate)
+        if not eligible:
+            return None, {
+                "used": False,
+                "proposal_found": False,
+                "reason": "No candidate met the conservative proposal gate",
+            }
+        proposal = max(
+            eligible,
+            key=lambda candidate: (
+                candidate.area_ratio,
+                candidate.full_card_boundary_score,
+                candidate.candidate_coverage_score,
+            ),
+        )
+        return proposal, {
+            "used": False,
+            "proposal_found": True,
+            "candidate_id": proposal.candidate_id,
+            "full_card_boundary_score": round(
+                proposal.full_card_boundary_score, 4
+            ),
+            "full_card_coverage_score": round(
+                proposal.candidate_coverage_score, 4
+            ),
+            "reason": "Proposal awaiting normal-pipeline confirmation",
+        }
+
+    def _validate_complete_card_proposal(
+        self,
+        proposal: _Candidate | None,
+        normal_candidates: list[_Candidate],
+        diagnostics: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Confirm a proposal only when it agrees with normal final geometry.
+
+        Confirmation is diagnostic only: candidate ordering and scores remain
+        those produced by the normal detector, so this path cannot make the
+        selected geometry worse or suppress recovery.
+        """
+        if proposal is None or not normal_candidates:
+            return diagnostics
+        normal = normal_candidates[0]
+        iou = self._intersection_over_union(
+            proposal.bounding_box, normal.bounding_box
+        )
+        area_ratio = normal.area_ratio / max(proposal.area_ratio, 1e-6)
+        proposal_center = np.mean(proposal.polygon, axis=0)
+        normal_center = np.mean(normal.polygon, axis=0)
+        diagonal = max(
+            1.0,
+            np.hypot(
+                proposal.bounding_box[2] - proposal.bounding_box[0],
+                proposal.bounding_box[3] - proposal.bounding_box[1],
+            ),
+        )
+        center_shift = float(
+            np.linalg.norm(normal_center - proposal_center) / diagonal
+        )
+        confirmed = (
+            iou >= 0.90
+            and 0.88 <= area_ratio <= 1.14
+            and center_shift <= 0.045
+        )
+        return {
+            **diagnostics,
+            "used": confirmed,
+            "normal_candidate_id": normal.candidate_id,
+            "proposal_normal_iou": round(iou, 4),
+            "proposal_normal_area_ratio": round(area_ratio, 4),
+            "proposal_normal_center_shift": round(center_shift, 4),
+            "reason": (
+                "Normal pipeline independently confirmed the proposal"
+                if confirmed
+                else "Proposal rejected because normal geometry did not agree"
+            ),
+        }
 
     def _appearance_metrics(
         self,
@@ -2218,6 +2416,7 @@ class CardDetector:
             full_card_boundary_score=candidate.full_card_boundary_score,
             candidate_coverage_score=candidate.candidate_coverage_score,
             internal_subregion_penalty=candidate.internal_subregion_penalty,
+            partial_card_candidate_penalty=candidate.partial_card_candidate_penalty,
             candidate_id=candidate.candidate_id,
             contains_candidates=tuple(candidate.contains_candidates),
             contained_by_candidates=tuple(candidate.contained_by_candidates),
@@ -2389,6 +2588,8 @@ class CardDetector:
         canvas_ratio = max(width, height) / min(width, height)
         if abs(log(canvas_ratio / self._target_ratio)) > 0.065:
             return False
+        if self._has_near_frame_outer_edge_support(pass_result.working_rgb):
+            return True
         # A PDF frame preprocessor (or a tightly captured image) can leave a
         # small safety band around an otherwise full-card raster.  A large,
         # ratio-correct contour inset on every side is direct full-card
@@ -2459,6 +2660,76 @@ class CardDetector:
             return False
         edge_density = cv2.countNonZero(interior_edges) / float(interior_edges.size)
         return edge_density >= 0.012 and float(np.std(interior)) >= 18.0
+
+    @staticmethod
+    def _has_near_frame_outer_edge_support(image: np.ndarray) -> bool:
+        """Recognize a card body whose four edges lie close to the raster frame.
+
+        This is global-extent evidence, not a local rectangle score. It is used
+        only after the raster itself has already matched the selected card's
+        aspect ratio closely.
+        """
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        gray = cv2.GaussianBlur(gray, (5, 5), 0.0)
+        height, width = gray.shape
+        band_x = max(3, int(round(width * 0.10)))
+        band_y = max(3, int(round(height * 0.10)))
+        trim_x = max(2, int(round(width * 0.12)))
+        trim_y = max(2, int(round(height * 0.12)))
+        if width - 2 * trim_x < 20 or height - 2 * trim_y < 20:
+            return False
+        gradient_x = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+        gradient_y = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+        threshold = 25.0
+
+        top_support = float(
+            np.max(
+                np.mean(
+                    gradient_y[:band_y, trim_x : width - trim_x]
+                    >= threshold,
+                    axis=1,
+                )
+            )
+        )
+        bottom_support = float(
+            np.max(
+                np.mean(
+                    gradient_y[height - band_y :, trim_x : width - trim_x]
+                    >= threshold,
+                    axis=1,
+                )
+            )
+        )
+        left_support = float(
+            np.max(
+                np.mean(
+                    gradient_x[trim_y : height - trim_y, :band_x]
+                    >= threshold,
+                    axis=0,
+                )
+            )
+        )
+        right_support = float(
+            np.max(
+                np.mean(
+                    gradient_x[trim_y : height - trim_y, width - band_x :]
+                    >= threshold,
+                    axis=0,
+                )
+            )
+        )
+        horizontal_pair = top_support >= 0.62 and bottom_support >= 0.62
+        vertical_pair = left_support >= 0.34 and right_support >= 0.34
+        interior = image[
+            band_y : height - band_y,
+            band_x : width - band_x,
+        ]
+        return (
+            horizontal_pair
+            and vertical_pair
+            and interior.size > 0
+            and float(np.std(interior)) >= 18.0
+        )
 
     def _attach_pass_debug(
         self,

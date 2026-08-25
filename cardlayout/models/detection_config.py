@@ -82,6 +82,14 @@ class CardDetectionConfig:
     two_inferred_edges_penalty: float = 0.18
     border_touch_penalty: float = 0.060
     plain_rectangle_penalty: float = 0.08
+    complete_card_min_area_ratio: float = 0.035
+    complete_card_max_area_ratio: float = 0.58
+    complete_card_min_boundary_score: float = 0.78
+    complete_card_min_coverage_score: float = 0.78
+    complete_card_min_ratio_score: float = 0.72
+    complete_card_min_geometry_score: float = 0.84
+    complete_card_min_edge_score: float = 0.72
+    partial_card_candidate_penalty: float = 0.22
     # Keep enough Stage-A alternatives for difficult perspective/occlusion
     # scenes. A real card can initially rank below crisp background rectangles.
     contextual_candidate_limit: int = 96
@@ -143,6 +151,25 @@ class CardDetectionConfig:
             raise ValueError("Small-area penalty range is invalid")
         if not 0 < self.poor_ratio_score_threshold < 1 or not 0 <= self.maximum_ratio_penalty <= 0.30:
             raise ValueError("Aspect-ratio penalty parameters are invalid")
+        if not (
+            0 < self.complete_card_min_area_ratio
+            < self.complete_card_max_area_ratio
+            < 1
+        ):
+            raise ValueError("Complete-card area range is invalid")
+        if not all(
+            0 < value <= 1
+            for value in (
+                self.complete_card_min_boundary_score,
+                self.complete_card_min_coverage_score,
+                self.complete_card_min_ratio_score,
+                self.complete_card_min_geometry_score,
+                self.complete_card_min_edge_score,
+            )
+        ):
+            raise ValueError("Complete-card evidence thresholds are invalid")
+        if not 0 <= self.partial_card_candidate_penalty <= 0.35:
+            raise ValueError("Partial-card candidate penalty is invalid")
         if self.contextual_candidate_limit < 5 or self.contextual_analysis_long_edge < 400:
             raise ValueError("Contextual candidate ranking limits are invalid")
         if not 0 <= self.one_edge_evidence_recovery <= self.two_edge_evidence_recovery <= 0.15:
