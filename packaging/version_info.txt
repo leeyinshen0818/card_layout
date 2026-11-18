@@ -1,0 +1,34 @@
+# Windows version resource for CardLayout.exe (PyInstaller EXE version=).
+# Keep filevers/prodvers and the string values in step with
+# cardlayout/__init__.py; CardLayout.spec refuses to build if they differ.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(0, 5, 0, 0),
+    prodvers=(0, 5, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'CardLayout'),
+            StringStruct('FileDescription', 'CardLayout - arrange card fronts and backs on A4'),
+            StringStruct('FileVersion', '0.5.0.0'),
+            StringStruct('InternalName', 'CardLayout'),
+            StringStruct('OriginalFilename', 'CardLayout.exe'),
+            StringStruct('ProductName', 'CardLayout'),
+            StringStruct('ProductVersion', '0.5.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

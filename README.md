@@ -10,33 +10,42 @@ require an internet connection.
 
 ## Highlights
 
-- Import JPG, JPEG, PNG, and PDF sources.
+- Import JPG, JPEG, PNG, and PDF sources with **Open files…**, per-side
+  **Choose**, or drag and drop.
 - Open a two-page PDF as Front and Back in one step.
 - Automatically detect the physical card boundary and correct perspective.
 - Detect generic blue, white, grey, dark, red, low-saturation, and multicolored
   physical cards without using card color as a requirement.
 - Handle low-texture card backs, weak edges, rounded corners, internal printed
   rectangles, and partial hand occlusion conservatively.
-- Adjust all four corners manually when automatic detection needs review.
-- Flip either side horizontally or vertically, or rotate it 180 degrees.
-- Apply independent sharpening and brightness/contrast presets to Front and Back.
+- Card detection runs in the background; each card shows a status chip.
+- **Adjust corners…** on every card opens the four-corner editor directly.
+- Rotate 180° or Mirror either side, and choose simple Sharpness and
+  Brightness settings, independently for Front and Back.
 - Move Front and Back vertically in precise 1 mm steps.
 - Preview the complete A4 portrait page at the correct relative dimensions.
 - Prepare and export a Front-only card without an empty Back placeholder.
 - Export an A4 PDF or a 300-DPI JPG directly to Downloads.
 - Run as a single standalone `CardLayout.exe` with no Python installation.
-- Start maximized and automatically use a compact layout on smaller or
-  display-scaled laptops.
+- Start maximized and scale the whole interface to the screen, from
+  1366 × 768 laptops to 2560 × 1440 displays.
 
 ## Typical workflow
 
-1. Open a two-page PDF, choose separate Front and Back files, or drag supported
-   files into the window.
-2. Review the automatically detected and perspective-corrected card images.
-3. Select **Adjust Corners** if a physical boundary needs manual correction.
-4. Click either card preview to open its Corrections sidebar or position controls.
+1. Select **Open files…** (one two-page PDF, or two files: first = Front,
+   second = Back), use **Choose Front** / **Choose Back**, or drag files into
+   the window.
+2. Wait for each card's status chip to change from **Detecting…**.
+3. If the chip says **Check corners** or **Card not found – set corners**, select
+   **Adjust corners…** on that card (the button is highlighted) and drag the four
+   corners onto the physical card.
+4. For orientation, position, or picture changes, select **More edits…** or click
+   the card on the A4 preview to open the Edit panel.
 5. Review the A4 preview.
 6. Select **Export PDF** or **Export JPG · 300 DPI**.
+
+Status chips: **Empty**, **Detecting…**, **Ready**, **Check corners**, and
+**Card not found – set corners**. A warning stays on the card until it is handled.
 
 Exports are saved automatically in the Windows Downloads folder. Existing files
 are never overwritten; CardLayout creates names such as `card-layout (1).pdf`.
@@ -46,11 +55,15 @@ After export, Windows Explorer opens the containing folder automatically.
 
 CardLayout supports:
 
-- Individual `.jpg`, `.jpeg`, `.png`, and `.pdf` files for either side
+- Individual `.jpg`, `.jpeg`, `.png`, and `.pdf` files for either side (a PDF
+  chosen for one side uses Page 1 only)
 - One two-page PDF, mapped as Page 1 → Front and Page 2 → Back
+- Two files at once, mapped as first → Front and second → Back
 - One-page PDFs, which leave Back empty
 - PDFs with more than two pages, using only the first two pages with a notice
 - Drag and drop of one PDF or up to two supported files
+
+File dialogs remember the last folder used (first use starts in Documents).
 
 PDF pages are rendered at high quality before entering the shared raster pipeline.
 For PDF input only, border-connected white, off-white, cream, or light-gray page
@@ -113,32 +126,32 @@ rectified preview, zoom, pan, Fit, 100%, reset-to-automatic, Done, and Cancel.
 Invalid crossing, overlapping, non-convex, out-of-bounds, or near-zero-area corner
 arrangements cannot be applied.
 
-### Image corrections
+### Edit panel
 
-The collapsible right sidebar provides thumbnail previews for:
+**More edits…**, or clicking a card on the A4 preview, opens a docked panel on
+the right. A **Front | Back** switch changes the edited side without closing it.
+From top to bottom:
 
-- Orientation: Flip Horizontal, Flip Vertical, Rotate 180 degrees, and Reset
-  Orientation
+- **Corners**: **Adjust corners…** (same editor as on the card)
+- **Orientation**: **Rotate 180°** and **Mirror** toggles; click again to undo
+- **Position**: **▲ Up 1 mm** / **▼ Down 1 mm**, with the offset shown as
+  Default, +2 mm, −2 mm, and so on
+- **Picture**: Sharpness (Normal, Sharper) and Brightness (Normal,
+  Bright + Contrast, Strong); the effect is shown live on the A4 preview
+- **Reset this card**: restores automatic corners, normal orientation, normal
+  picture settings, and the default position for that side
 
-- Sharpen / Soften: Soft, Normal, Sharp, Sharper
-- Brightness / Contrast: Normal, Bright +10, Bright +20,
-  Bright + Contrast, Strong Bright + Contrast
+Front and Back keep independent settings. Orientation is stored as
+non-destructive state after perspective correction and before picture settings.
+The current dependencies do not provide reliable semantic text recognition, so
+automatic orientation safely leaves uncertain images unchanged.
 
-Front and Back keep independent settings. **Reset corrections** restores only the
-selected side's appearance. The side-level **Reset** restores automatic geometry
-plus Normal orientation and appearance without reloading the source file.
-
-Orientation is stored as non-destructive state after perspective correction and
-before appearance corrections. The current standalone dependencies do not provide
-reliable semantic text recognition, so the automatic orientation stage safely
-leaves uncertain images unchanged; the manual controls are always available.
-
-Opening or closing the sidebar only changes the UI viewport. It does not rerun
-detection, reload images, reset corners, or change physical A4 coordinates.
+Opening or closing the panel only changes the UI. It does not rerun detection,
+reload images, reset corners, or change physical A4 coordinates.
 
 ## A4 layout and exports
 
-The built-in card preset is **Malaysia IC — 85.6 × 54 mm**. Both sides are
+The built-in card preset is **Malaysia IC / Driving Licence – 85.6 × 54 mm**. Both sides are
 centered horizontally on an A4 portrait page.
 
 | Setting | Value |
@@ -149,9 +162,10 @@ centered horizontally on an A4 portrait page.
 | Gap between cards | 20 mm |
 | JPG output | 2480 × 3508 px at 300 DPI |
 
-Front and Back can each be moved up or down independently in 1 mm steps and reset
-to their default position. These adjustments change physical placement; opening
-the Corrections sidebar or resizing the window does not.
+Front and Back can each be moved up or down independently in 1 mm steps from the
+Edit panel; **Reset this card** returns a side to its default position. These
+adjustments change physical placement; opening the panel or resizing the window
+does not.
 
 When only Front is loaded, the configured Front position is preserved and the
 rest of the page remains blank in both the preview and exported JPG/PDF. Loading
@@ -178,7 +192,8 @@ The executable:
 - Opens without a console window
 - Starts maximized
 - Bundles PySide6, OpenCV, NumPy, Pillow, PyMuPDF, and required Qt resources
-- Excludes the `tests` and `testing` directories
+- Excludes the `tests` directory
+- Carries a Windows version resource (Properties › Details shows the version)
 
 Because this is a PyInstaller one-file build, the first launch can take a little
 longer while bundled files are extracted to a temporary directory. That temporary
@@ -186,13 +201,11 @@ runtime is cleaned up when the application closes.
 
 ## Responsive UI
 
-CardLayout chooses its interface density from the available Qt logical screen
-size, which accounts for Windows display scaling. Common laptop workspaces such
-as 1600 × 900, 1536 × 864, and 1280 × 720 automatically use a compact layout.
-Larger desktop displays retain the standard spacing.
-
-Compact mode reduces panel width, preview height, fonts, button size, margins, and
-spacing while keeping the same controls and physical A4 placement.
+The interface was designed for 1920 × 1080 at 125% Windows scaling. Every other
+screen gets one proportional scale factor from its available area (taskbar
+excluded), so spacing, panels, and buttons keep the same proportions; text sizes
+come from real font metrics and never clip. On short screens the side panels
+scroll vertically instead of squeezing controls.
 
 ## Run from source
 
@@ -242,10 +255,11 @@ The tests cover input normalization, PDF/JPG parity, PDF frame trimming, layout
 geometry, exporters, detection scoring, low-texture backs, nested rectangles,
 partial edge and corner occlusion, perspective refinement, collapse protection,
 manual corners, orientation transforms, Front-only output, appearance corrections,
-reset behavior, responsive UI, and sidebar interactions. GUI tests run without
+reset behavior, responsive UI, Edit panel interactions, multi-file import, and
+background detection. GUI tests run without
 manually opening the application.
 
-The current suite contains **190 passing tests**. Detection regressions include
+The current suite contains **193 passing tests**. Detection regressions include
 generic card colors, strong perspective, close-up and distant cards, cards held by
 a hand, cluttered desks, monitor/keyboard distractors, strong internal rectangles,
 low-contrast card backs, dense text, chips, portrait regions, rounded corners, and

@@ -20,7 +20,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("CardLayout")
     app.setOrganizationName("CardLayout")
-    icon = QIcon(str(_resource_path("icon", "credit-card.ico")))
+    icon = QIcon(str(_resource_path("icon", "cardlayout_icon.ico")))
     app.setWindowIcon(icon)
     window = MainWindow()
     window.setWindowIcon(icon)

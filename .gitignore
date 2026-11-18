@@ -6,3 +6,6 @@ build/
 dist/
 *.egg-info/
 testing/
+*.log
+.vscode/
+.idea/
