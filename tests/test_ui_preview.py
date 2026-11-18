@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -8,9 +9,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import cv2
 import numpy as np
 import pytest
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QSettings, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QFileDialog, QFrame, QLabel, QMessageBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QLabel,
+    QMessageBox,
+    QWidget,
+)
 from PIL import Image
 
 from cardlayout.models.card_side import CardSide
@@ -18,7 +27,9 @@ from cardlayout.models.detection import CardDetectionResult
 from cardlayout.models.perspective import PerspectiveResult
 import cardlayout.ui.main_window as main_window_module
 import cardlayout.__main__ as app_module
+from cardlayout.ui.card_input_widget import card_status
 from cardlayout.ui.main_window import MainWindow
+from cardlayout.ui.scaling import MAX_SCALE, MIN_SCALE, compute_scale
 
 
 def _click_card(window: MainWindow, side: str) -> None:
@@ -83,23 +94,67 @@ def test_application_starts_maximized(monkeypatch) -> None:
     assert events == ["application-icon", "window-icon", "maximized"]
 
 
-def test_compact_ui_density_tracks_logical_screen_resolution() -> None:
-    assert MainWindow._uses_compact_ui(1600, 900)
-    assert MainWindow._uses_compact_ui(1536, 864)
-    assert MainWindow._uses_compact_ui(1280, 720)
-    assert not MainWindow._uses_compact_ui(1920, 1080)
+def test_ui_scale_tracks_available_logical_screen_area() -> None:
+    # 1920x1080 at 125% minus the taskbar is the design baseline.
+    assert compute_scale(1536, 816, 55) == pytest.approx(1.0)
+    # 1920x1080 at 100%: proportionally larger.
+    assert compute_scale(1920, 1032, 55) == pytest.approx(1.25, abs=0.02)
+    # The shorter dimension limits the factor.
+    assert compute_scale(1536, 600, 55) < 1536 / 1536
+    # 1366x768 at 125% and huge screens are clamped.
+    assert compute_scale(1093, 566, 55) == pytest.approx(MIN_SCALE)
+    assert compute_scale(3840, 2112, 55) == pytest.approx(MAX_SCALE)
 
 
-def test_compact_corrections_sidebar_uses_smaller_tiles() -> None:
+def _phone_photo(tmp_path: Path, name: str, angle: float = 22) -> Path:
+    pixels = np.full((600, 800, 3), (45, 55, 65), dtype=np.uint8)
+    box = cv2.boxPoints(((400, 300), (320, 202), angle)).astype(np.int32)
+    cv2.fillConvexPoly(pixels, box, (225, 235, 245))
+    cv2.polylines(pixels, [box], True, (10, 10, 10), 5)
+    path = tmp_path / name
+    Image.fromarray(pixels).save(path)
+    return path
+
+
+def _window_with_cards(tmp_path: Path, front=None, back=None) -> MainWindow:
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
-    if window.compact_ui:
-        assert window.corrections_sidebar.maximumWidth() == 280
-        for button in window.corrections_sidebar._buttons.values():
-            assert button.width() == 104
-            assert button.height() == 66
-            assert button.iconSize().width() == 68
-            assert button.iconSize().height() == 40
+    window.front = front if front is not None else _card_side(tmp_path, "front")
+    window.back = back if back is not None else _card_side(tmp_path, "back")
+    window._refresh()
+    window.show()
+    app.processEvents()
+    return window
+
+
+def test_edit_panel_buttons_fit_their_text_and_scroll_only_vertically(
+    tmp_path: Path,
+) -> None:
+    window = _window_with_cards(tmp_path)
+    window._open_editor("front")
+    QApplication.processEvents()
+    panel = window.edit_panel
+    buttons = [
+        panel.rotate_button,
+        panel.mirror_button,
+        panel.up_button,
+        panel.down_button,
+        panel.corners_button,
+        panel.reset_button,
+        *panel.side_buttons.values(),
+        *panel.sharpness_buttons.values(),
+        *panel.brightness_buttons.values(),
+    ]
+    for button in buttons:
+        assert button.width() >= button.minimumSizeHint().width()
+        assert button.height() >= button.minimumSizeHint().height()
+    assert panel.width() >= panel.minimumWidth()
+    assert panel.scroll.horizontalScrollBarPolicy() == (
+        Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
+    assert window.controls_scroll.horizontalScrollBarPolicy() == (
+        Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    )
     window.close()
 
 
@@ -109,20 +164,22 @@ def test_main_window_uses_clean_responsibility_based_layout() -> None:
     window.show()
     app.processEvents()
 
-    header = window.findChild(QFrame, "header")
-    assert header is not None
-    assert [label.text() for label in header.findChildren(QLabel)] == ["CardLayout"]
-    assert not any(
-        label.text() == "Click Front or Back to select and edit it"
-        for label in window.findChildren(QLabel)
+    texts = [label.text() for label in window.findChildren(QLabel)]
+    assert "CardLayout" not in texts
+    assert window.findChild(QFrame, "header") is None
+    assert not any("No uploads" in text for text in texts)
+    assert window.size_caption.text() == (
+        "Malaysia IC / Driving Licence – 85.6 × 54 mm"
     )
-    assert window.pdf_button.parent() is not header
-    assert window.swap_button.parent() is not header
-    assert window.pdf_button.geometry().top() < window.front_widget.geometry().top()
+    assert "Print exported PDF at Actual Size / 100%" in texts
+    assert window.open_button.text() == "Open files…"
+    assert window.open_button.geometry().top() < window.front_widget.geometry().top()
     assert window.front_widget.geometry().bottom() < window.swap_button.geometry().top()
     assert window.swap_button.geometry().bottom() < window.back_widget.geometry().top()
     assert window.swap_button.text() == "⇅  Swap Front / Back"
-
+    assert window.export_pdf_button.objectName() == "primaryButton"
+    assert window.export_jpg_button.objectName() == "jpgButton"
+    assert window.findChild(QWidget, "previewControls") is None
     window.close()
 
 
@@ -169,75 +226,66 @@ def test_exports_save_directly_to_downloads_without_save_dialog(
     window.close()
 
 
-def test_preview_selection_reveals_controls_and_moves_each_side(
+def test_edit_panel_position_buttons_move_each_side_and_show_offset(
     tmp_path: Path,
 ) -> None:
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow()
-    window.front = _card_side(tmp_path, "front")
-    window.back = _card_side(tmp_path, "back")
-    window._refresh()
-    window.show()
-    app.processEvents()
+    window = _window_with_cards(tmp_path)
+    panel = window.edit_panel
 
     _click_card(window, "front")
     assert window.preview.selected_side == "front"
-    assert window.preview.position_controls.isVisible()
-    assert window.preview.selection_label.text() == "FRONT  ·  Default position"
+    assert panel.isVisible()
+    assert panel.position_label.text() == "Default"
 
-    QTest.mouseClick(window.preview.move_down_button, Qt.MouseButton.LeftButton)
-    app.processEvents()
-    assert window.engine.vertical_offset("front") == 1.0
-    assert window.preview.selection_label.text() == "FRONT  ·  1 mm down"
+    QTest.mouseClick(panel.down_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(panel.down_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert window.engine.vertical_offset("front") == 2.0
+    assert panel.position_label.text() == "+2 mm"
 
     _click_card(window, "back")
-    QTest.mouseClick(window.preview.move_up_button, Qt.MouseButton.LeftButton)
-    app.processEvents()
-    assert window.engine.vertical_offset("front") == 1.0
-    assert window.engine.vertical_offset("back") == -1.0
-    assert window.preview.selection_label.text() == "BACK  ·  1 mm up"
+    QTest.mouseClick(panel.up_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(panel.up_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert window.engine.vertical_offset("front") == 2.0
+    assert window.engine.vertical_offset("back") == -2.0
+    assert panel.position_label.text() == "−2 mm"
 
-    window.preview.clear_selection()
-    assert not window.preview.position_controls.isVisible()
+    QTest.mouseClick(panel.close_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert not panel.isVisible()
+    assert window.preview.selected_side is None
     window.close()
 
 
-def test_front_only_preview_leaves_back_position_completely_blank(
+def test_empty_preview_slot_is_a_faint_placeholder_and_not_clickable(
     tmp_path: Path,
 ) -> None:
-    app = QApplication.instance() or QApplication([])
-    window = MainWindow()
-    window.front = _card_side(tmp_path, "front")
-    window.back = None
+    window = _window_with_cards(tmp_path)
+    window._set_card("back", None)
     window._refresh()
-    window.show()
-    app.processEvents()
+    QApplication.processEvents()
 
     page_rect = window.preview._page_rect()
     back_rect = window.preview._card_target(
         window.engine.calculate().back, page_rect
     ).toAlignedRect()
     image = window.preview.grab().toImage()
-    sample_points = (
-        back_rect.center(),
-        QPoint(
-            back_rect.left() + back_rect.width() // 4,
-            back_rect.top() + back_rect.height() // 4,
-        ),
+    inside = QPoint(
+        back_rect.left() + back_rect.width() // 4,
+        back_rect.top() + back_rect.height() // 4,
     )
-    for point in sample_points:
-        assert image.pixelColor(point).getRgb()[:3] == (255, 255, 255)
+    assert image.pixelColor(inside).getRgb()[:3] == (255, 255, 255)
+    border = image.pixelColor(QPoint(back_rect.left(), back_rect.center().y()))
+    assert min(border.getRgb()[:3]) > 180  # faint, not a solid dark frame
 
     _click_card(window, "back")
     assert window.preview.selected_side is None
-    assert not window.corrections_sidebar.isVisible()
+    assert not window.edit_panel.isVisible()
     window.close()
 
 
-def test_orientation_controls_are_immediate_independent_and_resettable(
-    tmp_path: Path,
-) -> None:
-    app = QApplication.instance() or QApplication([])
+def test_rotate_and_mirror_are_independent_toggles(tmp_path: Path) -> None:
     pattern = Image.new("RGB", (4, 2))
     pattern.putdata(
         [
@@ -245,335 +293,422 @@ def test_orientation_controls_are_immediate_independent_and_resettable(
             (255, 0, 255), (0, 255, 255), (40, 50, 60), (70, 80, 90),
         ]
     )
-    window = MainWindow()
-    window.front = _card_side(tmp_path, "front", pattern)
-    window.back = _card_side(tmp_path, "back", pattern.copy())
-    window._refresh()
-    window.show()
-    app.processEvents()
-
-    _click_card(window, "front")
-    QTest.mouseClick(
-        window.corrections_sidebar.orientation_buttons["flip_horizontal"],
-        Qt.MouseButton.LeftButton,
+    window = _window_with_cards(
+        tmp_path,
+        _card_side(tmp_path, "front", pattern),
+        _card_side(tmp_path, "back", pattern.copy()),
     )
-    app.processEvents()
-    assert window.front.orientation_state.flip_horizontal
+    panel = window.edit_panel
+    _click_card(window, "front")
+
+    QTest.mouseClick(panel.mirror_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert panel.mirror_button.isChecked() and not panel.rotate_button.isChecked()
     assert window.front.best_image.tobytes() == pattern.transpose(
         Image.Transpose.FLIP_LEFT_RIGHT
     ).tobytes()
     assert window.back.orientation_state.is_normal
-    assert "Flipped Horizontal" in window.corrections_sidebar.orientation_status.text()
 
-    _click_card(window, "back")
-    QTest.mouseClick(
-        window.corrections_sidebar.orientation_buttons["flip_vertical"],
-        Qt.MouseButton.LeftButton,
-    )
-    QTest.mouseClick(
-        window.corrections_sidebar.orientation_buttons["rotate_180"],
-        Qt.MouseButton.LeftButton,
-    )
-    app.processEvents()
-    assert window.front.orientation_state.flip_horizontal
-    assert window.back.orientation_state == window.back.orientation_state.__class__(
-        flip_horizontal=True
-    )
+    QTest.mouseClick(panel.rotate_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert panel.mirror_button.isChecked() and panel.rotate_button.isChecked()
+    assert window.front.best_image.tobytes() == pattern.transpose(
+        Image.Transpose.FLIP_TOP_BOTTOM
+    ).tobytes()
 
-    QTest.mouseClick(
-        window.corrections_sidebar.orientation_buttons["reset"],
-        Qt.MouseButton.LeftButton,
-    )
-    app.processEvents()
-    assert window.back.orientation_state.is_normal
-    assert window.back.best_image.tobytes() == pattern.tobytes()
+    QTest.mouseClick(panel.mirror_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert not panel.mirror_button.isChecked() and panel.rotate_button.isChecked()
+    assert window.front.best_image.tobytes() == pattern.transpose(
+        Image.Transpose.ROTATE_180
+    ).tobytes()
+
+    QTest.mouseClick(panel.rotate_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert window.front.orientation_state.is_normal
+    assert window.front.best_image.tobytes() == pattern.tobytes()
+    assert not hasattr(panel, "orientation_status")
     window.close()
 
 
-def test_side_panel_is_clean_and_corrections_reset_without_removing_file(
+def test_card_panel_is_clean_and_reset_this_card_restores_everything(
     tmp_path: Path,
 ) -> None:
     app = QApplication.instance() or QApplication([])
-    pixels = np.full((600, 800, 3), (45, 55, 65), dtype=np.uint8)
-    box = cv2.boxPoints(((400, 300), (320, 202), 22)).astype(np.int32)
-    cv2.fillConvexPoly(pixels, box, (225, 235, 245))
-    cv2.polylines(pixels, [box], True, (10, 10, 10), 5)
-    path = tmp_path / "phone-photo.png"
-    Image.fromarray(pixels).save(path)
-
+    path = _phone_photo(tmp_path, "phone-photo.png")
     window = MainWindow()
     window.show()
     app.processEvents()
     window._load_side(str(path), "front")
-    app.processEvents()
+    window.wait_for_detection()
 
     assert window.front is not None
     assert window.front.detection_result is not None
     assert window.front.detection_result.success
-    assert window.front.detected_image is not None
     assert window.front.rectified_image is not None
     original_bytes = window.front.original_image.tobytes()
-    automatic = window.front.automatic_perspective_result
-    assert automatic is not None and automatic.rectified_image is not None
-    automatic_bytes = automatic.rectified_image.tobytes()
+    automatic_bytes = window.front.best_image.tobytes()
 
-    assert not hasattr(window.front_widget, "original_button")
-    assert not hasattr(window.front_widget, "detected_button")
-    assert not hasattr(window.front_widget, "corrected_button")
-    assert not hasattr(window.front_widget, "redetect_button")
-    assert not hasattr(window.front_widget, "reset_detection_button")
-    assert not hasattr(window.front_widget, "reset_correction_button")
-    assert window.front_widget.choose_button.text() == "Choose Front"
-    assert window.front_widget.clear_button.text() == "Clear"
-    assert window.front_widget.adjust_corners_button.text() == "Adjust Corners"
-    assert window.front_widget.reset_button.text() == "Reset"
+    card = window.front_widget
+    for removed in ("edit_button", "reset_button", "clear_button"):
+        assert not hasattr(card, removed)
+    assert card.choose_button.text() == "Choose Front"
+    assert card.remove_button.text() == "Remove"
+    assert card.corners_button.text() == "Adjust corners…"
+    assert card.more_button.text() == "More edits…"
+    assert not window.back_widget.corners_button.isEnabled()
+    assert not window.back_widget.more_button.isEnabled()
+    assert window.back_widget.preview.text() == "Drop or choose a file"
 
-    assert not window.corrections_sidebar.isVisible()
-    preview_width_closed = window.preview_panel.width()
-    _click_card(window, "front")
+    QTest.mouseClick(card.more_button, Qt.MouseButton.LeftButton)
     app.processEvents()
-    assert window.corrections_sidebar.isVisible()
-    assert window.corrections_sidebar.title.text() == "Corrections · FRONT"
-    popover = window.corrections_sidebar
-    assert popover.parent() is window.splitter
-    assert window.preview_panel.width() < preview_width_closed
-    assert popover.geometry().left() >= window.preview_panel.geometry().right()
-    assert window.preview._page_rect().center().x() == pytest.approx(
-        window.preview.width() / 2, abs=1
-    )
-    assert set(popover._buttons) == {
-        ("sharpen", "soft"),
-        ("sharpen", "normal"),
-        ("sharpen", "sharp"),
-        ("sharpen", "sharper"),
-        ("tone", "normal"),
-        ("tone", "bright_10"),
-        ("tone", "bright_20"),
-        ("tone", "bright_contrast"),
-        ("tone", "strong_bright_contrast"),
+    panel = window.edit_panel
+    assert panel.isVisible()
+    assert not panel.reset_button.isEnabled()
+    assert set(panel.sharpness_buttons) == {"normal", "sharper"}
+    assert set(panel.brightness_buttons) == {
+        "normal",
+        "bright_contrast",
+        "strong_bright_contrast",
     }
+    assert panel.brightness_buttons["strong_bright_contrast"].text() == "Strong"
 
+    QTest.mouseClick(panel.sharpness_buttons["sharper"], Qt.MouseButton.LeftButton)
     QTest.mouseClick(
-        popover._buttons[("sharpen", "sharp")], Qt.MouseButton.LeftButton
+        panel.brightness_buttons["bright_contrast"], Qt.MouseButton.LeftButton
     )
-    app.processEvents()
-    assert window.front.image_correction_state.sharpen == "sharp"
-    assert window.front.best_image.tobytes() != automatic_bytes
-    assert window.front.original_image.tobytes() == original_bytes
-    assert window.front_widget.reset_button.isEnabled()
-
-    QTest.mouseClick(window.front_widget.reset_button, Qt.MouseButton.LeftButton)
-    app.processEvents()
-    assert window.front is not None
-    assert window.front.image_correction_state.is_normal
-    assert window.front.detection_result is not None
-    assert window.front.detected_image is not None
-    assert window.front.best_image.tobytes() == automatic_bytes
-
-    QTest.mouseClick(window.front_widget.clear_button, Qt.MouseButton.LeftButton)
-    app.processEvents()
-    assert window.front is None
-    window.close()
-
-
-def test_redetect_requires_confirmation_before_replacing_manual_corners(
-    tmp_path: Path, monkeypatch
-) -> None:
-    app = QApplication.instance() or QApplication([])
-    pixels = np.full((600, 800, 3), (45, 55, 65), dtype=np.uint8)
-    box = cv2.boxPoints(((400, 300), (320, 202), 12)).astype(np.int32)
-    cv2.fillConvexPoly(pixels, box, (225, 235, 245))
-    cv2.polylines(pixels, [box], True, (10, 10, 10), 5)
-    path = tmp_path / "manual-redetect.png"
-    Image.fromarray(pixels).save(path)
-    window = MainWindow()
-    window._load_side(str(path), "front")
-    assert window.front is not None
-    assert window.front.detection_result is not None
+    QTest.mouseClick(panel.rotate_button, Qt.MouseButton.LeftButton)
+    QTest.mouseClick(panel.down_button, Qt.MouseButton.LeftButton)
     manual = window.card_processor.apply_manual_correction(
         window.front, window.front.detection_result.polygon_points
     )
-    assert manual.success and window.front.has_manual_correction
-    window.engine.adjust_vertical_offset("front", 5.0)
+    assert manual.success
+    window._refresh()
+    app.processEvents()
+    assert window.front.image_correction_state.sharpen == "sharper"
+    assert window.front.best_image.tobytes() != automatic_bytes
+    assert panel.reset_button.isEnabled()
 
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.No,
-    )
-    window._redetect_side("front")
-    assert window.front.has_manual_correction
-
-    monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
-    )
-    window._redetect_side("front")
+    QTest.mouseClick(panel.reset_button, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert window.front.image_correction_state.is_normal
+    assert window.front.orientation_state.is_normal
     assert not window.front.has_manual_correction
-    assert window.front.automatic_perspective_result is not None
-    assert window.engine.vertical_offset("front") == 5.0
+    assert window.engine.vertical_offset("front") == 0.0
+    assert window.front.best_image.tobytes() == automatic_bytes
+    assert window.front.original_image.tobytes() == original_bytes
+    assert panel.isVisible()
+    assert not panel.reset_button.isEnabled()
+    assert panel.sharpness_buttons["normal"].isChecked()
+
+    QTest.mouseClick(card.remove_button, Qt.MouseButton.LeftButton)
+    app.processEvents()
+    assert window.front is None
+    assert not panel.isVisible()
+    assert card.status_text == "Empty"
     window.close()
 
 
-def test_front_and_back_correction_tiles_update_independently(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    front_image = Image.new("RGB", (428, 270), (110, 135, 160))
-    back_image = Image.new("RGB", (428, 270), (145, 115, 90))
-    front = CardSide(
-        side="front",
-        source_path=tmp_path / "front.png",
-        source_type="image",
-        source_page=None,
-        original_image=front_image,
-        processed_image=front_image.copy(),
-    )
-    back = CardSide(
-        side="back",
-        source_path=tmp_path / "back.png",
-        source_type="image",
-        source_page=None,
-        original_image=back_image,
-        processed_image=back_image.copy(),
-    )
-    window = MainWindow()
-    window.front, window.back = front, back
-    window._refresh()
-    window.show()
-    app.processEvents()
+def test_edit_panel_switches_target_without_closing(tmp_path: Path) -> None:
+    window = _window_with_cards(tmp_path)
+    panel = window.edit_panel
+    closed_width = window.preview_panel.width()
 
     QTest.mouseClick(window.front_widget.preview, Qt.MouseButton.LeftButton)
-    QTest.mouseClick(
-        window.corrections_sidebar._buttons[("sharpen", "sharp")],
-        Qt.MouseButton.LeftButton,
-    )
-    app.processEvents()
-    assert front.image_correction_state.sharpen == "sharp"
-    assert back.image_correction_state.is_normal
+    QApplication.processEvents()
+    assert panel.isVisible()
+    assert panel.title.text() == "Edit – Front"
+    assert panel.side_buttons["front"].isChecked()
+    assert window.preview.selected_side == "front"
+    assert window.preview_panel.width() < closed_width
+    assert panel.geometry().left() >= window.preview_panel.geometry().right()
 
     QTest.mouseClick(
-        window.corrections_sidebar.close_button, Qt.MouseButton.LeftButton
+        panel.sharpness_buttons["sharper"], Qt.MouseButton.LeftButton
     )
-    app.processEvents()
-    assert not window.corrections_sidebar.isVisible()
-    assert front.image_correction_state.sharpen == "sharp"
-    _click_card(window, "back")
-    assert window.corrections_sidebar.title.text() == "Corrections · BACK"
+    QTest.mouseClick(panel.side_buttons["back"], Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert panel.isVisible()
+    assert panel.title.text() == "Edit – Back"
+    assert window.edit_side == "back"
+    assert window.preview.selected_side == "back"
+    assert panel.sharpness_buttons["normal"].isChecked()
+
     QTest.mouseClick(
-        window.corrections_sidebar._buttons[
-            ("tone", "bright_contrast")
-        ],
-        Qt.MouseButton.LeftButton,
+        panel.brightness_buttons["bright_contrast"], Qt.MouseButton.LeftButton
     )
-    app.processEvents()
-    assert front.image_correction_state.sharpen == "sharp"
-    assert front.image_correction_state.tone == "normal"
-    assert back.image_correction_state.sharpen == "normal"
-    assert back.image_correction_state.tone == "bright_contrast"
+    QApplication.processEvents()
+    assert window.front.image_correction_state.sharpen == "sharper"
+    assert window.front.image_correction_state.tone == "normal"
+    assert window.back.image_correction_state.sharpen == "normal"
+    assert window.back.image_correction_state.tone == "bright_contrast"
+
+    QTest.mouseClick(panel.side_buttons["front"], Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert panel.sharpness_buttons["sharper"].isChecked()
+
+    # With only one side loaded the other target cannot be chosen.
+    window._remove_side("back")
+    QApplication.processEvents()
+    assert panel.isVisible()
+    assert not panel.side_buttons["back"].isEnabled()
+
+    window.resize(1050, 720)
+    QApplication.processEvents()
+    assert panel.geometry().left() >= window.preview_panel.geometry().right()
+    assert window.preview.width() >= window.preview.minimumWidth()
     window.close()
 
 
-def test_sidebar_reflows_preview_switches_side_and_preserves_state(
-    tmp_path: Path,
+def test_card_status_wording(tmp_path: Path) -> None:
+    card = _card_side(tmp_path, "front")
+    assert card_status(None) == ("Empty", "muted")
+    assert card_status(card, busy=True)[0] == "Detecting…"
+
+    card.apply_detection(
+        CardDetectionResult(success=False, confidence=0.1, confidence_level="low")
+    )
+    assert card_status(card) == ("Card not found – set corners", "error")
+
+    rough = ((10.0, 10.0), (400.0, 12.0), (398.0, 260.0), (12.0, 258.0))
+    card.apply_detection(
+        CardDetectionResult(
+            success=True,
+            confidence=0.5,
+            confidence_level="medium",
+            polygon_points=rough,
+            cropped_image=card.original_image.copy(),
+        )
+    )
+    card.apply_automatic_correction(
+        PerspectiveResult(
+            success=True,
+            source_points=rough,
+            refined_points=rough,
+            rectified_image=card.original_image.copy(),
+            status="review",
+        )
+    )
+    assert card_status(card) == ("Check corners", "warn")
+
+    card.apply_manual_correction(
+        PerspectiveResult(
+            success=True,
+            source_points=rough,
+            rectified_image=card.original_image.copy(),
+            status="corrected",
+            method="manual",
+        )
+    )
+    assert card_status(card) == ("Ready", "ok")
+
+    window = _window_with_cards(tmp_path, front=card)
+    assert window.front_widget.status_text == "Ready"
+    assert window.front_widget.status_chip.isVisible()
+    window._set_card("back", None)
+    window._refresh()
+    assert window.back_widget.status_text == "Empty"
+    window.close()
+
+
+def test_failed_detection_status_stays_on_card_and_corners_open_from_edges(
+    tmp_path: Path, monkeypatch
 ) -> None:
     app = QApplication.instance() or QApplication([])
-    front_image = Image.new("RGB", (428, 270), (105, 135, 165))
-    back_image = Image.new("RGB", (428, 270), (70, 115, 160))
+    path = tmp_path / "plain.png"
+    Image.new("RGB", (600, 400), (90, 90, 90)).save(path)
     window = MainWindow()
-    window.front = CardSide(
-        side="front",
-        source_path=tmp_path / "front.png",
-        source_type="image",
-        source_page=None,
-        original_image=front_image,
-        processed_image=front_image.copy(),
-    )
-    window.back = CardSide(
-        side="back",
-        source_path=tmp_path / "back.png",
-        source_type="image",
-        source_page=None,
-        original_image=back_image,
-        processed_image=back_image.copy(),
-    )
-    window._refresh()
+    window._load_side(str(path), "front")
+    window.wait_for_detection()
+    assert window.front is not None
+    assert window.front_widget.status_text == "Card not found – set corners"
+    window.statusBar().clearMessage()
+    app.processEvents()
+    assert window.front_widget.status_text == "Card not found – set corners"
+
+    captured = {}
+
+    class _Editor:
+        result = None
+
+        def __init__(self, image, automatic_points, corrector, confidence, current_points, parent):
+            del image, corrector, confidence, parent
+            captured["automatic"] = automatic_points
+            captured["current"] = current_points
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(main_window_module, "CornerEditorDialog", _Editor)
+    window._open_editor("front")
+    QTest.mouseClick(window.edit_panel.corners_button, Qt.MouseButton.LeftButton)
+    corners = captured["automatic"]
+    assert len(corners) == 4
+    assert corners[0][0] < 50 and corners[2][0] > 550
+    window.close()
+
+
+def test_adjust_corners_button_is_emphasised_by_state_and_opens_editor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    path = tmp_path / "plain.png"
+    Image.new("RGB", (600, 400), (90, 90, 90)).save(path)
+    window = MainWindow()
     window.show()
+    window._load_side(str(path), "front")
+    window.wait_for_detection()
+    card = window.front_widget
+    assert card.status_text == "Card not found – set corners"
+    assert card.corners_button.property("emphasis") == "strong"
+    window._open_editor("front")
     app.processEvents()
+    panel_layout = window.edit_panel.body_layout
+    # Corners is the first section, directly under the Front | Back switch.
+    assert panel_layout.itemAt(0).widget().text() == "CORNERS"
+    assert panel_layout.indexOf(window.edit_panel.corners_button) == 1
+    assert window.edit_panel.corners_button.property("emphasis") == "strong"
 
-    layout_before = window.engine.calculate()
-    closed_width = window.preview_panel.width()
-    assert not window.corrections_sidebar.isVisible()
-    assert window.corrections_button.isVisible()
+    opened: list[str] = []
 
-    QTest.mouseClick(window.corrections_button, Qt.MouseButton.LeftButton)
+    class _Editor:
+        def __init__(self, image, automatic_points, corrector, confidence, current_points, parent):
+            del corrector, confidence, current_points, parent
+            opened.append("editor")
+            self.result = PerspectiveResult(
+                success=True,
+                source_points=automatic_points,
+                rectified_image=image.copy(),
+                status="corrected",
+                method="manual",
+            )
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "CornerEditorDialog", _Editor)
+    QTest.mouseClick(card.corners_button, Qt.MouseButton.LeftButton)
     app.processEvents()
-    expanded_width = window.preview_panel.width()
-    assert window.preview.selected_side == "front"
-    assert window.corrections_sidebar.title.text() == "Corrections · FRONT"
-    assert window.corrections_sidebar.isVisible()
-    assert not window.corrections_button.isVisible()
-    assert expanded_width < closed_width
-    assert window.corrections_sidebar.geometry().left() >= (
-        window.preview_panel.geometry().right()
+    assert opened == ["editor"]
+    assert card.status_text == "Ready"
+    assert card.corners_button.property("emphasis") == "normal"
+    assert window.edit_panel.corners_button.property("emphasis") == "normal"
+    assert card.more_button.objectName() == "secondaryButton"
+    window.close()
+
+
+def test_open_files_routes_pdf_pages_and_file_pairs(
+    tmp_path: Path,
+    monkeypatch,
+    sample_jpg: Path,
+    sample_png: Path,
+    two_page_pdf: Path,
+    three_page_pdf: Path,
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    two_page, three_page = two_page_pdf, three_page_pdf
+    infos: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "information", lambda parent, title, text: infos.append(text)
+    )
+    window = MainWindow()
+    window.settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(two_page)], ""),
+    )
+    QTest.mouseClick(window.open_button, Qt.MouseButton.LeftButton)
+    window.wait_for_detection()
+    assert window.front.source_path == two_page and window.front.source_page == 1
+    assert window.back.source_path == two_page and window.back.source_page == 2
+    assert window.settings.value(main_window_module.LAST_FOLDER_KEY) == str(
+        tmp_path.resolve()
     )
 
-    _click_card(window, "back")
-    assert window.preview.selected_side == "back"
-    assert window.corrections_sidebar.isVisible()
-    assert window.corrections_sidebar.title.text() == "Corrections · BACK"
-    QTest.mouseClick(
-        window.corrections_sidebar._buttons[("tone", "bright_10")],
-        Qt.MouseButton.LeftButton,
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(sample_png), str(sample_jpg)], ""),
     )
-    app.processEvents()
-    assert window.back.image_correction_state.tone == "bright_10"
-    assert window.front.image_correction_state.is_normal
+    QTest.mouseClick(window.open_button, Qt.MouseButton.LeftButton)
+    window.wait_for_detection()
+    assert window.front.source_path == sample_png and window.front.side == "front"
+    assert window.back.source_path == sample_jpg and window.back.side == "back"
+    assert infos == []
 
-    layout_before_reset = window.engine.calculate()
-    QTest.mouseClick(
-        window.corrections_sidebar.reset_button, Qt.MouseButton.LeftButton
+    # Two files where one is a multi-page PDF: that side uses page 1 only.
+    monkeypatch.setattr(
+        QFileDialog,
+        "getOpenFileNames",
+        lambda *args, **kwargs: ([str(sample_jpg), str(three_page)], ""),
     )
-    app.processEvents()
-    assert window.back.image_correction_state.is_normal
-    assert window.corrections_sidebar.isVisible()
-    assert window.preview.selected_side == "back"
-    assert not window.corrections_sidebar.reset_button.isEnabled()
-    assert window.engine.calculate() == layout_before_reset
+    QTest.mouseClick(window.open_button, Qt.MouseButton.LeftButton)
+    window.wait_for_detection()
+    assert window.front.source_path == sample_jpg
+    assert window.back.source_path == three_page and window.back.source_page == 1
+    assert len(infos) == 1 and infos[0].startswith("Back:")
 
-    QTest.mouseClick(
-        window.corrections_sidebar._buttons[("tone", "bright_10")],
-        Qt.MouseButton.LeftButton,
-    )
-    app.processEvents()
-    assert window.back.image_correction_state.tone == "bright_10"
+    # Per-side Choose loads only that side and starts in the remembered folder.
+    starts: list[str] = []
 
-    QTest.mouseClick(
-        window.corrections_sidebar.close_button, Qt.MouseButton.LeftButton
-    )
-    app.processEvents()
-    assert not window.corrections_sidebar.isVisible()
-    assert window.corrections_button.isVisible()
-    assert window.preview.selected_side is None
-    assert window.preview_panel.width() > expanded_width
-    assert window.back.image_correction_state.tone == "bright_10"
-    layout_after = window.engine.calculate()
-    assert layout_after.front == layout_before.front
-    assert layout_after.back == layout_before.back
-    assert window.preview._page_rect().center().x() == pytest.approx(
-        window.preview.width() / 2, abs=1
-    )
+    def _choose(parent, caption, start, file_filter):
+        starts.append(start)
+        return str(two_page), ""
 
-    QTest.mouseClick(window.corrections_button, Qt.MouseButton.LeftButton)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", _choose)
+    QTest.mouseClick(window.front_widget.choose_button, Qt.MouseButton.LeftButton)
+    window.wait_for_detection()
+    assert starts == [str(tmp_path.resolve())]
+    assert window.front.source_path == two_page and window.front.source_page == 1
+    assert window.back.source_path == three_page
+    window.close()
     app.processEvents()
-    assert window.corrections_sidebar.isVisible()
-    assert window.preview.selected_side == "front"
 
-    window.resize(1050, 720)
+
+def test_detection_runs_in_background_and_stale_results_are_discarded(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = QApplication.instance() or QApplication([])
+    path = _phone_photo(tmp_path, "slow.png", angle=12)
+    gate = threading.Event()
+    window = MainWindow()
+    real_detect = window.card_processor.detect
+
+    def _slow_detect(card):
+        gate.wait(5)
+        return real_detect(card)
+
+    monkeypatch.setattr(window.card_processor, "detect", _slow_detect)
+    window._load_side(str(path), "front")
+    # Loading returned while detection is still blocked in the worker.
+    assert window.is_detecting("front")
+    assert window.front_widget.status_text == "Detecting…"
+    assert not window.front_widget.corners_button.isEnabled()
+    assert window.back_widget.choose_button.isEnabled()
+    assert window.front_widget.remove_button.isEnabled()
+    pending = window.front
+
+    window._remove_side("front")
+    gate.set()
+    window._detect_pool.waitForDone()
     app.processEvents()
-    assert window.corrections_sidebar.geometry().left() >= (
-        window.preview_panel.geometry().right()
-    )
-    assert window.preview.width() >= window.preview.minimumWidth()
+    assert window.front is None
+    assert pending.detection_result is None
+    assert window.front_widget.status_text == "Empty"
+
+    gate.clear()
+    window._load_side(str(path), "front")
+    first = window.front
+    window._load_side(str(path), "front")
+    second = window.front
+    gate.set()
+    window.wait_for_detection()
+    assert window.front is not first and window.front is not second
+    assert window.front.source_path == second.source_path
+    assert window.front.detection_result is not None
+    assert window.front_widget.status_text in {"Ready", "Check corners"}
     window.close()
 
 

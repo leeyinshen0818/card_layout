@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 from PIL import Image
 from PySide6.QtCore import QPointF, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QBrush, QPen, QPixmap, QPolygonF, QTransform, QWheelEvent
+from PySide6.QtGui import QColor, QBrush, QFont, QPen, QPixmap, QPolygonF, QTransform, QWheelEvent
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -27,6 +27,10 @@ from cardlayout.models.detection import Point
 from cardlayout.models.perspective import PerspectiveResult
 from cardlayout.services.perspective_corrector import PerspectiveCorrector
 from cardlayout.ui.image_utils import pil_to_qimage
+from cardlayout.ui.scaling import UiScale, bounded_to_screen, sharp_pixmap
+
+
+HANDLE_RADIUS = 8
 
 
 class _CornerHandle(QGraphicsEllipseItem):
@@ -36,7 +40,9 @@ class _CornerHandle(QGraphicsEllipseItem):
         bounds: tuple[int, int],
         moved: Callable[[], None],
     ) -> None:
-        super().__init__(-8, -8, 16, 16)
+        super().__init__(
+            -HANDLE_RADIUS, -HANDLE_RADIUS, 2 * HANDLE_RADIUS, 2 * HANDLE_RADIUS
+        )
         self._bounds = bounds
         self._moved = moved
         self.setBrush(QBrush(QColor("#ffffff")))
@@ -92,12 +98,17 @@ class CornerEditorCanvas(QGraphicsView):
         for name, point in zip(self.CORNER_NAMES, points, strict=True):
             handle = _CornerHandle(point, image.size, self._handles_moved)
             self._scene.addItem(handle)
-            label = QGraphicsSimpleTextItem(name)
+            # A child of the handle inherits its zoom-independent coordinates,
+            # so the label keeps a fixed screen-pixel gap outside the card.
+            label = QGraphicsSimpleTextItem(name, handle)
+            font = QFont(label.font())
+            font.setBold(True)
+            font.setPointSizeF(max(font.pointSizeF(), 9.0) + 1.0)
+            label.setFont(font)
             label.setBrush(QBrush(QColor("#ffffff")))
-            label.setPen(QPen(QColor("#153d7a"), 2))
-            label.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
-            label.setZValue(6)
-            self._scene.addItem(label)
+            label.setPen(QPen(QColor("#0f172a"), 0.8))
+            label.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+            label.setPos(self._label_offset(name, label))
             self._handles.append(handle)
             self._labels.append(label)
         self.setRenderHints(self.renderHints())
@@ -137,9 +148,28 @@ class CornerEditorCanvas(QGraphicsView):
             return
         polygon = QPolygonF([handle.pos() for handle in self._handles])
         self._polygon.setPolygon(polygon)
-        for handle, label in zip(self._handles, self._labels, strict=True):
-            label.setPos(handle.pos() + QPointF(10, -24))
         self.corners_changed.emit(self.corners)
+
+    @staticmethod
+    def _label_offset(name: str, label: QGraphicsSimpleTextItem) -> QPointF:
+        """Place the label diagonally outside its corner, clear of the handle."""
+        bounds = label.boundingRect()
+        gap = HANDLE_RADIUS + 4
+        x = -gap - bounds.width() if name in ("TL", "BL") else gap
+        y = -gap - bounds.height() if name in ("TL", "TR") else gap
+        return QPointF(x, y)
+
+
+def _button_style(ui: UiScale) -> str:
+    px = ui.px
+    return f"""
+        QPushButton {{ min-height: {px(28)}px; padding: 0 {px(12)}px; border-radius: {px(6)}px; font-weight: 600; }}
+        QPushButton#secondaryButton {{ background: #ffffff; color: #234c86; border: 1px solid #9fb2cc; }}
+        QPushButton#secondaryButton:hover {{ background: #edf3fb; }}
+        QPushButton#primaryButton {{ background: #245fc5; color: white; border: 1px solid #245fc5; }}
+        QPushButton#primaryButton:hover {{ background: #1d4fa8; }}
+        QPushButton#primaryButton:disabled {{ background: #f1f3f6; color: #aab2bf; border-color: #e2e6ec; }}
+    """
 
 
 class CornerEditorDialog(QDialog):
@@ -161,34 +191,25 @@ class CornerEditorDialog(QDialog):
         self._automatic_points = automatic_points
         self._result: PerspectiveResult | None = None
         self.setWindowTitle("Adjust Card Corners")
-        screen = self.screen()
-        available = screen.availableGeometry() if screen is not None else None
-        screen_width = available.width() if available is not None else 1920
-        screen_height = available.height() if available is not None else 1080
-        self.compact_ui = self._uses_compact_ui(screen_width, screen_height)
-        if self.compact_ui:
-            self.setMinimumSize(720, 480)
-            target_width = min(1040, max(720, screen_width - 40))
-            target_height = min(620, max(480, screen_height - 60))
-        else:
-            self.setMinimumSize(820, 560)
-            target_width = min(1120, max(820, screen_width - 60))
-            target_height = min(720, max(560, screen_height - 80))
-        self.resize(target_width, target_height)
+        # Same proportional factor as the main window; never larger than the
+        # available screen so Done/Cancel always stay reachable.
+        self.ui = UiScale.for_widget(parent if parent is not None else self)
+        ui = self.ui
+        self.setMinimumSize(bounded_to_screen(ui.size(720, 480), self))
+        self.resize(bounded_to_screen(ui.size(1040, 620), self))
 
         self.canvas = CornerEditorCanvas(image, current_points or automatic_points)
-        if self.compact_ui:
-            self.canvas.setMinimumSize(420, 320)
+        self.canvas.setMinimumSize(ui.size(420, 320))
         self.preview = QLabel("Rectified preview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumWidth(220 if self.compact_ui else 300)
+        self.preview.setMinimumWidth(ui.px(220))
         self.preview.setStyleSheet(
             "background:#eef2f7; border:1px solid #cbd5e1; color:#64748b;"
         )
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.canvas)
         splitter.addWidget(self.preview)
-        splitter.setSizes([650, 270] if self.compact_ui else [750, 350])
+        splitter.setSizes([ui.px(650), ui.px(270)])
 
         self.warning = QLabel()
         self.warning.setWordWrap(True)
@@ -201,8 +222,13 @@ class CornerEditorDialog(QDialog):
         self.reset_button.clicked.connect(
             lambda: self.canvas.set_corners(self._automatic_points)
         )
+        for button in (self.fit_button, self.actual_button, self.reset_button):
+            button.setObjectName("secondaryButton")
+            button.setAutoDefault(False)
         controls = QHBoxLayout()
-        controls.addWidget(QLabel("Drag TL, TR, BR, and BL onto the physical card corners."))
+        instructions = QLabel("Drag TL, TR, BR, and BL onto the physical card corners.")
+        instructions.setWordWrap(True)
+        controls.addWidget(instructions, 1)
         controls.addStretch()
         controls.addWidget(self.fit_button)
         controls.addWidget(self.actual_button)
@@ -214,6 +240,12 @@ class CornerEditorDialog(QDialog):
         )
         self.apply_button = self.buttons.button(QDialogButtonBox.StandardButton.Apply)
         self.apply_button.setText("Done")
+        self.apply_button.setObjectName("primaryButton")
+        cancel = self.buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel.setObjectName("secondaryButton")
+        # Own button styling so the dialog looks the same with or without the
+        # main window's style sheet; the main window still sets the font.
+        self.setStyleSheet(_button_style(ui))
         self.buttons.clicked.connect(self._button_clicked)
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -227,10 +259,6 @@ class CornerEditorDialog(QDialog):
         layout.addWidget(self.warning)
         layout.addWidget(self.buttons)
         self._corners_changed(self.canvas.corners)
-
-    @staticmethod
-    def _uses_compact_ui(screen_width: int, screen_height: int) -> bool:
-        return screen_width < 1680 or screen_height < 950
 
     @property
     def result(self) -> PerspectiveResult | None:
@@ -261,11 +289,7 @@ class CornerEditorDialog(QDialog):
         target.setWidth(max(1, target.width() - 20))
         target.setHeight(max(1, target.height() - 20))
         self.preview.setPixmap(
-            pixmap.scaled(
-                target,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            sharp_pixmap(pixmap, target, self.devicePixelRatioF())
         )
         self.preview.setText("")
 

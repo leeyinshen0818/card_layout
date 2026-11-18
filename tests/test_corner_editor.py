@@ -123,9 +123,11 @@ def test_compact_corner_editor_keeps_done_action_visible() -> None:
 
     assert dialog.apply_button.text() == "Done"
     assert dialog.apply_button.isVisible()
-    if dialog.compact_ui:
-        assert dialog.minimumWidth() == 720
-        assert dialog.minimumHeight() == 480
-        assert dialog.preview.minimumWidth() == 220
-        assert dialog.canvas.minimumHeight() == 320
+    available = dialog.screen().availableGeometry()
+    assert dialog.width() <= available.width()
+    assert dialog.height() <= available.height()
+    assert dialog.minimumWidth() <= available.width()
+    assert dialog.minimumHeight() <= available.height()
+    assert dialog.preview.minimumWidth() == dialog.ui.px(220)
+    assert dialog.canvas.minimumHeight() == dialog.ui.px(320)
     dialog.close()
